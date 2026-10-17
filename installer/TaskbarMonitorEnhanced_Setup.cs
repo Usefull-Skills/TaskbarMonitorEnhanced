@@ -9,6 +9,11 @@ using System.Globalization;
 using System.IO.Compression;
 using System.Reflection;
 using System.Security.Principal;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+using System.Security.AccessControl;
+using System.Threading.Tasks;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -20,14 +25,14 @@ using Microsoft.Win32;
 [assembly: AssemblyProduct("Taskbar Monitor Enhanced")]
 [assembly: AssemblyCompany("Dr. Ali-Akbar Emadeddin")]
 [assembly: AssemblyCopyright("Copyright © 2026 Dr. Ali-Akbar Emadeddin")]
-[assembly: AssemblyVersion("1.7.2.0")]
-[assembly: AssemblyFileVersion("1.7.2.0")]
-[assembly: AssemblyInformationalVersion("1.7.2+r155")]
+[assembly: AssemblyVersion("1.7.8.0")]
+[assembly: AssemblyFileVersion("1.7.8.0")]
+[assembly: AssemblyInformationalVersion("1.7.8+r286")]
 
 internal static partial class SetupProgram
 {
     const string Product="Taskbar Monitor Enhanced";
-    const string Version="1.7.2";
+    const string Version="1.7.8";
     const string SensorProtocolVersion="1.1.2+r21";
     const string SensorSupervisorVersion="1.3.0+r33";
     const string Publisher="Dr. Ali-Akbar Emadeddin";
@@ -58,7 +63,7 @@ internal static partial class SetupProgram
       "Payload.COPYRIGHT_AND_ATTRIBUTION.md",
       "Payload.AI_ASSISTED_DEVELOPMENT.md",
       "Payload.THIRD_PARTY_NOTICES.md",
-      "Payload.RELEASE_NOTES_v1.7.2.md",
+      "Payload.RELEASE_NOTES_v1.7.8.md",
       "Payload.UPSTREAM_REFERENCE_GPL_NOTICE.md",
       "Payload.TaskbarMonitorEnhanced_Setup.cs"
     };
@@ -104,50 +109,430 @@ internal static partial class SetupProgram
         }catch{}
     }
 
-    static int ElevatedHelper(string helper,string args,int timeoutMs)
+    // R293: PowerShell code is transported from this immutable, embedded PE resource
+    // via an in-memory command. Never elevate a .ps1 from writable Temp.
+    static string Base64Utf8Argument(string value)
+    {
+        if(String.IsNullOrWhiteSpace(value) || value.Length>4096)
+            throw new InvalidDataException("Sensor helper argument missing or too long.");
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    // R295: compact only transport text, not the readable embedded .ps1 source.
+    // Refuse here-strings and continuation tokens that need verbatim whitespace.
+    static string CompactTrustedHelperSource(string source)
+    {
+        if(String.IsNullOrWhiteSpace(source) ||
+           source.IndexOf("@'",StringComparison.Ordinal)>=0 ||
+           source.IndexOf("@\"",StringComparison.Ordinal)>=0)
+            throw new InvalidDataException("Trusted sensor helper contains unsupported multiline text.");
+        StringBuilder compact=new StringBuilder();
+        foreach(string raw in source.Replace("\r\n","\n").Split('\n'))
+        {
+            string line=raw.Trim();
+            if(line.Length==0 || line.StartsWith("#",StringComparison.Ordinal))continue;
+            if(line.EndsWith("`",StringComparison.Ordinal))
+                throw new InvalidDataException("Trusted sensor helper cannot compact continuation lines.");
+            compact.Append(line).Append('\n');
+        }
+        return compact.ToString();
+    }
+
+    // Compatibility-only builder for pure non-launching tests; live runas passes a fresh pipe.
+    static string BuildElevatedHelperCommand(string mode,string payload,string appRoot,string user)
+    {
+        return BuildElevatedHelperCommandWithPipe(mode,payload,appRoot,user,
+            "tbme_sensor_fixture_nonruntime","00000000000000000000000000000000");
+    }
+    static string BuildElevatedHelperCommandWithPipe(string mode,string payload,string appRoot,string user,
+        string pipeName,string pipeNonce)
+    {
+        if(!Regex.IsMatch(pipeName,@"^tbme_sensor_(?:[0-9a-f]{32}|fixture_nonruntime)$") ||
+           !Regex.IsMatch(pipeNonce,@"^[0-9a-f]{32}$"))
+            throw new InvalidDataException("Sensor status channel parameters invalid.");
+        if(mode!="Install" && mode!="Uninstall")
+            throw new InvalidDataException("Unexpected elevated sensor mode.");
+        string brokerHash=Sha256Resource("Payload.TaskbarMonitorSensorBroker.exe");
+        string supervisorHash=Sha256Resource("Payload.TaskbarMonitorSensorSupervisor.exe");
+        string backendZipHash=Sha256Resource("Payload.LibreHardwareMonitor.zip");
+        if(brokerHash.Length!=64 || supervisorHash.Length!=64 || backendZipHash.Length!=64)
+            throw new InvalidDataException("Protected sensor resource hash unavailable.");
+        string packed;
+        using(Stream resource=Resource("Payload.TBME_Setup_Elevated_Helper.ps1"))
+        {
+            if(resource==null)throw new InvalidDataException("Trusted embedded sensor helper missing.");
+            using(StreamReader reader=new StreamReader(resource,Encoding.UTF8,true))
+            {
+                string source=CompactTrustedHelperSource(reader.ReadToEnd());
+                byte[] textBytes=Encoding.UTF8.GetBytes(source);
+                if(textBytes.Length<1000 || textBytes.Length>120000)
+                    throw new InvalidDataException("Unexpected sensor helper source size.");
+                using(MemoryStream buffer=new MemoryStream())
+                {
+                    using(GZipStream zipper=new GZipStream(buffer,CompressionMode.Compress,true))
+                        zipper.Write(textBytes,0,textBytes.Length);
+                    packed=Convert.ToBase64String(buffer.ToArray());
+                }
+            }
+        }
+        // Every caller-supplied parameter is separately base64-encoded as data.
+        // In particular, a quoted Windows user/path cannot inject PowerShell syntax.
+        string script=
+          "$ErrorActionPreference='Stop'\n"+
+          "$blob=[Convert]::FromBase64String('"+packed+"')\n"+
+          "$ms=[IO.MemoryStream]::new($blob)\n"+
+          "$gzip=[IO.Compression.GZipStream]::new($ms,[IO.Compression.CompressionMode]0)\n"+
+          "$reader=[IO.StreamReader]::new($gzip)\n"+
+          "try{$code=$reader.ReadToEnd()}finally{$reader.Close()}\n"+
+          "function d($s){[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s))}\n"+
+          "$p=d('"+Base64Utf8Argument(payload)+"')\n"+
+          "$a=d('"+Base64Utf8Argument(appRoot)+"')\n"+
+          "$u=d('"+Base64Utf8Argument(user)+"')\n"+
+          // These are strict [a-f0-9] + static-prefix allowlisted values, not untrusted scripts.
+          "$q='"+pipeName+"'\n"+
+          "$n='"+pipeNonce+"'\n"+
+          "& ([ScriptBlock]::Create($code)) -Mode '"+mode+"' -PayloadDir $p -AppRoot $a -UserId $u -ExpectedBrokerSHA256 '"+brokerHash+"' -ExpectedSupervisorSHA256 '"+supervisorHash+"' -ExpectedBackendZipSHA256 '"+backendZipHash+"' -StatusPipe $q -StatusNonce $n\n";
+        string encoded=Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        // Preserve the established UTF-16 EncodedCommand path when it fits.
+        // Windows Process creation caps the entire command line at 32,767 chars.
+        if(encoded.Length<=32000)
+            return "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand "+encoded;
+        // R304: the SAME in-memory, PE-embedded trusted helper can be transported
+        // as a constant PowerShell -Command string for long profile names.
+        // Variable caller input is only UTF-8/Base64 data; mode is whitelisted
+        // and resource digests are SHA-256 hex. No user-controlled quote or
+        // PowerShell tokens can enter this command source. Never use -File.
+        if(script.IndexOf('"')>=0 || script.IndexOf('\0')>=0)
+            throw new InvalidDataException("Unexpected quote or null in trusted helper bootstrap.");
+        string fallback="-NoProfile -NonInteractive -WindowStyle Hidden -Command \"& { "+script+" }\"";
+        // Leave margin for the executable path and OS quoting. A truly huge
+        // value must still fail closed instead of truncating or using Temp.
+        if(fallback.Length>30000)
+            throw new InvalidDataException("Trusted sensor helper command exceeds safe limit.");
+        return fallback;
+    }
+
+    // R298: runas uses ShellExecuteEx, which searches the current directory,
+    // Windows and PATH for an unqualified executable. Pin the native OS host.
+    static string TrustedSystemPowerShellPath()
+    {
+        string system=Path.GetFullPath(Environment.SystemDirectory);
+        if(!Path.IsPathRooted(system) || !Directory.Exists(system))
+            throw new InvalidOperationException("Trusted Windows system directory unavailable.");
+        string first=Path.Combine(system,"WindowsPowerShell");
+        string folder=Path.Combine(first,"v1.0");
+        string exe=Path.Combine(folder,"powershell.exe");
+        if(!Directory.Exists(first) || !Directory.Exists(folder) || !File.Exists(exe))
+            throw new InvalidOperationException("Trusted Windows PowerShell executable missing.");
+        foreach(string candidate in new string[]{system,first,folder,exe})
+        {
+            if((File.GetAttributes(candidate)&FileAttributes.ReparsePoint)!=0)
+                throw new InvalidOperationException("Trusted PowerShell host is a reparse path.");
+        }
+        return exe;
+    }
+
+    // Kept separate from Process.Start so the exact runas target can be
+    // inspected in disposable Windows without granting UAC or starting it.
+    static ProcessStartInfo BuildElevatedSensorProcessInfo(string mode,string payload,string appRoot,string user)
+    {
+        return BuildElevatedSensorProcessInfoWithPipe(mode,payload,appRoot,user,
+            "tbme_sensor_fixture_nonruntime","00000000000000000000000000000000");
+    }
+    static ProcessStartInfo BuildElevatedSensorProcessInfoWithPipe(string mode,string payload,string appRoot,string user,
+        string pipeName,string pipeNonce)
     {
         ProcessStartInfo psi=new ProcessStartInfo();
-        psi.FileName="powershell.exe";
-        psi.Arguments="-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \""+helper+"\" "+args;
+        psi.FileName=TrustedSystemPowerShellPath();
+        psi.WorkingDirectory=Path.GetDirectoryName(psi.FileName);
+        psi.Arguments=BuildElevatedHelperCommandWithPipe(mode,payload,appRoot,user,pipeName,pipeNonce);
         psi.UseShellExecute=true;
         psi.Verb="runas";
+        return psi;
+    }
 
-        Process elevated=null;
-        Exception launchError=null;
-        ManualResetEvent launchFinished=new ManualResetEvent(false);
-        Thread launchThread=new Thread(new ThreadStart(delegate{
-            try{elevated=Process.Start(psi);}
-            catch(Exception ex){launchError=ex;}
-            finally{try{launchFinished.Set();}catch{}}
-        }));
-        launchThread.IsBackground=true;
-        try{launchThread.SetApartmentState(ApartmentState.STA);}catch{}
 
-        DateTime overallDeadline=DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        launchThread.Start();
+    // R080 (DRAFT): asInvoker Setup owns result/log persistence, not runas.
+    // No user-tree mutation is performed by this object until OS child identity
+    // and a one-shot authenticated pipe result have been validated.
+    sealed class SensorStatusReceiver : IDisposable
+    {
+        const int MaxWireBytes=65000;
+        [DllImport("kernel32.dll",SetLastError=true)]
+        static extern bool GetNamedPipeClientProcessId(SafePipeHandle handle,out uint pid);
+        readonly NamedPipeServerStream stream;
+        readonly IAsyncResult connection;
+        readonly string nonce;
+        Task<string> greeting, frame;
+        bool connected, acknowledged;
+        string message;
+        public readonly string Name;
+        public string Nonce {get {return nonce;}}
+        public bool HasResult {get {return message!=null;}}
 
-        int launchBudget=Math.Min(30000,Math.Max(1000,timeoutMs));
-        DateTime launchDeadline=DateTime.UtcNow.AddMilliseconds(launchBudget);
-        while(!launchFinished.WaitOne(100) && DateTime.UtcNow<launchDeadline)
-            Application.DoEvents();
-
-        if(!launchFinished.WaitOne(0))
-            return 125;
-
-        if(launchError!=null)
-            throw new InvalidOperationException("Could not start protected-sensor helper.",launchError);
-        if(elevated==null)
-            throw new InvalidOperationException("Could not start protected-sensor helper.");
-
-        while(!elevated.HasExited && DateTime.UtcNow<overallDeadline){
-            Application.DoEvents();
-            Thread.Sleep(100);
+        static string BoundedLine(Stream input,int max)
+        {
+            using(MemoryStream buffer=new MemoryStream())
+            {
+                for(int i=0;i<=max;i++)
+                {
+                    int b=input.ReadByte();
+                    if(b<0)throw new IOException("Sensor IPC channel ended without result.");
+                    if(b==10)return new UTF8Encoding(false,true).GetString(buffer.ToArray());
+                    if(i==max)throw new InvalidDataException("Sensor IPC frame over limit.");
+                    buffer.WriteByte((byte)b);
+                }
+            }
+            throw new InvalidDataException("Sensor IPC frame never terminated.");
         }
-        if(!elevated.HasExited){
-            try{elevated.Kill();}catch{}
-            return 124;
+
+        public SensorStatusReceiver()
+        {
+            Name="tbme_sensor_"+Guid.NewGuid().ToString("N");
+            nonce=Guid.NewGuid().ToString("N");
+            PipeSecurity acl=new PipeSecurity();
+            acl.SetAccessRuleProtection(true,false);
+            SecurityIdentifier current=WindowsIdentity.GetCurrent().User;
+            if(current==null)throw new InvalidOperationException("Requesting user SID unavailable.");
+            acl.AddAccessRule(new PipeAccessRule(current,PipeAccessRights.FullControl,AccessControlType.Allow));
+            // R305 requires the elevated Helper's effective account SID to
+            // equal this requesting user SID, including under runas / UAC.
+            // A different administrator account MUST fail closed. Never allow
+            // all Authenticated Users to claim the one-instance IPC slot.
+            // Kernel client PID, live process/session and nonce are separately checked.
+            stream=new NamedPipeServerStream(Name,PipeDirection.InOut,1,
+                PipeTransmissionMode.Byte,PipeOptions.Asynchronous,4096,4096,acl);
+            connection=stream.BeginWaitForConnection(null,null);
         }
-        return elevated.ExitCode;
+
+        public void Poll(Process child)
+        {
+            if(!connected && connection.IsCompleted)
+            {
+                stream.EndWaitForConnection(connection);
+                if(child==null || child.HasExited)
+                    throw new InvalidDataException("Sensor IPC connected without a live expected child.");
+                uint peer;
+                if(!GetNamedPipeClientProcessId(stream.SafePipeHandle,out peer))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                if(peer!=(uint)child.Id || child.SessionId!=Process.GetCurrentProcess().SessionId)
+                    throw new InvalidDataException("Sensor IPC client OS process identity mismatch.");
+                connected=true;
+                greeting=Task.Factory.StartNew<string>(()=>BoundedLine(stream,96));
+            }
+            if(connected && !acknowledged && greeting.IsCompleted)
+            {
+                if(!String.Equals(greeting.GetAwaiter().GetResult(),"HELLO|"+nonce,StringComparison.Ordinal))
+                    throw new InvalidDataException("Sensor IPC HELLO nonce mismatch.");
+                byte[] ack=Encoding.UTF8.GetBytes("ACK|"+nonce+"\n");
+                stream.Write(ack,0,ack.Length);
+                stream.Flush();
+                acknowledged=true;
+                frame=Task.Factory.StartNew<string>(()=>BoundedLine(stream,MaxWireBytes));
+            }
+            if(acknowledged && message==null && frame.IsCompleted)
+                message=frame.GetAwaiter().GetResult();
+        }
+
+        public void PersistAsInvoker()
+        {
+            PersistToUserRoot(AppRoot);
+        }
+
+        // Kept internal for the exact native Windows regression to exercise
+        // the *same* persistence logic on a new disposable test-owned directory.
+        // The production asInvoker caller always uses its real AppRoot.
+
+        // R090 strict, bounded JSON contract. The transport authenticates a
+        // peer/process/nonce, NOT the semantic contents of its JSON message.
+        // Only a flat object with all source-owned typed fields can ever be
+        // stored as a normal user's sensor status.
+        static void ValidateSensorStatusJson(string json)
+        {
+            var schema=new Dictionary<string,char>(StringComparer.Ordinal)
+            {
+                {"Status",'s'},{"Message",'s'},{"PawnIOStatus",'s'},
+                {"PawnIOExitCode",'i'},{"RebootRequired",'b'},
+                {"TaskInstalled",'b'},{"SensorHealthy",'b'},
+                {"SupervisorHealthy",'b'},{"CpuTransportHealthy",'b'},
+                {"GpuTransportHealthy",'b'},{"StorageTransportHealthy",'b'},
+                {"CpuDataAvailable",'b'},{"Architecture",'s'},
+                {"RollbackPerformed",'b'},{"RollbackSucceeded",'b'},
+                {"PreviousSensorLayerPresent",'b'},{"Time",'s'},{"LogPath",'s'}
+            };
+            if(json==null || json.Length>10000)throw new InvalidDataException("Sensor JSON too large.");
+            // No external JSON package / new assembly dependency: exact
+            // PowerShell ConvertTo-Json flat schema, RFC-style JSON string
+            // escaping, and nonexponential bounded field tokenization.
+            const string member=@"\A\s*""(?<name>[A-Za-z][A-Za-z0-9]*)""\s*:\s*(?<value>""(?:[^""\\\u0000-\u001F]|\\(?:[""\\/bfnrt]|u[0-9a-fA-F]{4}))*""|true|false|null|-?(?:0|[1-9][0-9]*))\s*";
+            int pos=0;
+            Action skip=()=>{while(pos<json.Length && (json[pos]==' ' || json[pos]=='\t' || json[pos]=='\r' || json[pos]=='\n'))pos++;};
+            skip();
+            if(pos>=json.Length || json[pos++]!='{')throw new InvalidDataException("Sensor JSON must be an object.");
+            var seen=new HashSet<string>(StringComparer.Ordinal);
+            var values=new Dictionary<string,string>(StringComparer.Ordinal);
+            while(true)
+            {
+                skip();
+                Match field=Regex.Match(json.Substring(pos),member,RegexOptions.CultureInvariant,
+                                        TimeSpan.FromMilliseconds(600));
+                if(!field.Success)throw new InvalidDataException("Invalid sensor JSON field syntax.");
+                string key=field.Groups["name"].Value;
+                string value=field.Groups["value"].Value;
+                char kind;
+                if(!schema.TryGetValue(key,out kind) || !seen.Add(key))
+                    throw new InvalidDataException("Unknown or repeated sensor JSON field.");
+                bool quoted=value.Length>=2 && value[0]=='"' && value[value.Length-1]=='"';
+                if(kind=='s' && !quoted)throw new InvalidDataException("Sensor string field not quoted.");
+                if(kind=='b' && value!="true" && value!="false")
+                    throw new InvalidDataException("Sensor boolean field invalid.");
+                if(kind=='i' && value!="null")
+                {
+                    int number;
+                    if(!Int32.TryParse(value,NumberStyles.AllowLeadingSign,CultureInfo.InvariantCulture,out number))
+                        throw new InvalidDataException("Sensor numeric field invalid.");
+                }
+                values.Add(key,value);
+                pos+=field.Length;
+                skip();
+                if(pos>=json.Length)throw new InvalidDataException("Truncated sensor JSON object.");
+                if(json[pos]==','){pos++;continue;}
+                if(json[pos]=='}'){pos++;break;}
+                throw new InvalidDataException("Invalid sensor JSON object separator.");
+            }
+            skip();
+            if(pos!=json.Length || seen.Count!=schema.Count)
+                throw new InvalidDataException("Sensor JSON fields incomplete or extra data.");
+            // Status is canonical, unescaped ASCII; ambiguous encodings
+            // cannot silently claim a different product health state.
+            string status=values["Status"];
+            switch(status)
+            {
+                case "\"READY\"":
+                    if(values["SensorHealthy"]!="true" || values["SupervisorHealthy"]!="true" ||
+                       values["RebootRequired"]!="false")
+                        throw new InvalidDataException("READY status contradicts sensor health.");
+                    break;
+                case "\"REBOOT_REQUIRED\"":
+                    if(values["RebootRequired"]!="true")
+                        throw new InvalidDataException("Reboot status has no reboot flag.");
+                    break;
+                case "\"DEGRADED\"":
+                case "\"DEGRADED_DATA\"":
+                case "\"DEGRADED_ROLLED_BACK\"":
+                case "\"DEGRADED_ROLLBACK_FAILED\"":
+                case "\"DEGRADED_OTHER_USER_SENSOR_LAYER_PRESERVED\"":
+                case "\"UNAVAILABLE\"":
+                case "\"UNINSTALLED\"":
+                case "\"UNINSTALL_WARNING\"":
+                    break;
+                default:
+                    throw new InvalidDataException("Unknown sensor status value.");
+            }
+            if(values["Message"]=="\"\"" || values["Architecture"]=="\"\"" ||
+               values["Time"]=="\"\"" || values["LogPath"]=="\"\"")
+                throw new InvalidDataException("Mandatory sensor metadata empty.");
+            if(status=="\"DEGRADED_ROLLED_BACK\"" &&
+               (values["RollbackPerformed"]!="true" || values["RollbackSucceeded"]!="true"))
+                throw new InvalidDataException("Rollback success result inconsistent.");
+            if(status=="\"DEGRADED_ROLLBACK_FAILED\"" && values["RollbackPerformed"]!="true")
+                throw new InvalidDataException("Rollback failure status inconsistent.");
+        }
+
+        internal void PersistToUserRoot(string userRoot)
+        {
+            if(String.IsNullOrWhiteSpace(userRoot) || !Path.IsPathRooted(userRoot))
+                throw new InvalidDataException("Sensor status destination root invalid.");
+            string canonical=Path.GetFullPath(userRoot).TrimEnd(Path.DirectorySeparatorChar);
+            if(canonical.Length<4)
+                throw new InvalidDataException("Sensor status destination root unsafe.");
+            if(message==null)throw new InvalidDataException("No verified sensor status frame.");
+            string[] parts=message.Split('|');
+            if(parts.Length!=4 || parts[0]!="TBME80" ||
+               !String.Equals(parts[1],nonce,StringComparison.Ordinal))
+                throw new InvalidDataException("Sensor IPC result schema or nonce mismatch.");
+            string json=new UTF8Encoding(false,true).GetString(Convert.FromBase64String(parts[2]));
+            string logs=new UTF8Encoding(false,true).GetString(Convert.FromBase64String(parts[3]));
+            if(logs.Length>25000)
+                throw new InvalidDataException("Sensor IPC log exceeds size limit.");
+            ValidateSensorStatusJson(json);
+            string logRoot=Path.Combine(canonical,"Logs");
+            Directory.CreateDirectory(logRoot);
+            if(logs.Length>0)
+                File.AppendAllText(Path.Combine(logRoot,"sensor_install.log"),logs+"\n",Encoding.UTF8);
+            File.WriteAllText(Path.Combine(logRoot,"sensor_install_result.json"),json,Encoding.UTF8);
+        }
+
+        public void Dispose() {stream.Dispose();}
+    }
+
+    // Uses exactly one OS-attested pipe client for this new UAC child. On
+    // cancellation/spoof/transport fault fail closed; never ask runas to write
+    // status into the calling user's reparse-mutable AppData.
+
+    static int ElevatedHelper(string mode,string payload,string appRoot,string user,int timeoutMs)
+    {
+        using(SensorStatusReceiver channel=new SensorStatusReceiver())
+        {
+            ProcessStartInfo psi=BuildElevatedSensorProcessInfoWithPipe(
+                mode,payload,appRoot,user,channel.Name,channel.Nonce);
+            Process elevated=null;
+            Exception launchError=null;
+            using(ManualResetEvent launchFinished=new ManualResetEvent(false))
+            {
+                Thread launchThread=new Thread(new ThreadStart(delegate {
+                    try {elevated=Process.Start(psi);}
+                    catch(Exception ex) {launchError=ex;}
+                    finally {try{launchFinished.Set();}catch{}}
+                }));
+                launchThread.IsBackground=true;
+                try {launchThread.SetApartmentState(ApartmentState.STA);}catch{}
+                DateTime deadline=DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                launchThread.Start();
+                int launchBudget=Math.Min(30000,Math.Max(1000,timeoutMs));
+                DateTime launchDeadline=DateTime.UtcNow.AddMilliseconds(launchBudget);
+                while(!launchFinished.WaitOne(100) && DateTime.UtcNow<launchDeadline)
+                    Application.DoEvents();
+                if(!launchFinished.WaitOne(0))return 125;
+                if(launchError!=null)
+                    throw new InvalidOperationException("Could not launch protected sensor helper.",launchError);
+                if(elevated==null)
+                    throw new InvalidOperationException("Protected sensor helper process unavailable.");
+                try
+                {
+                    DateTime exitSeen=DateTime.MaxValue;
+                    while(DateTime.UtcNow<deadline)
+                    {
+                        channel.Poll(elevated);
+                        if(elevated.HasExited)
+                        {
+                            if(channel.HasResult)break;
+                            if(exitSeen==DateTime.MaxValue)
+                                exitSeen=DateTime.UtcNow.AddSeconds(3);
+                            if(DateTime.UtcNow>=exitSeen)break;
+                        }
+                        Application.DoEvents();
+                        Thread.Sleep(75);
+                    }
+                    if(!elevated.HasExited)
+                    {
+                        try{elevated.Kill();}catch{}
+                        return 124;
+                    }
+                    if(channel.HasResult)channel.PersistAsInvoker();
+                    else if(elevated.ExitCode==0)
+                        throw new InvalidDataException("Protected sensor helper ended without authenticated status.");
+                    return elevated.ExitCode;
+                }
+                catch
+                {
+                    // Only the newly launched Helper owned by this Setup is stopped.
+                    if(!elevated.HasExited){try{elevated.Kill();}catch{}}
+                    throw;
+                }
+                finally {elevated.Dispose();}
+            }
+        }
     }
 
     static void Shortcut(string path,string target)
@@ -228,8 +613,8 @@ internal static partial class SetupProgram
         string sensorMode=sensorOutcome==null?"":(sensorOutcome.LayerMode??"");
         string json="{\r\n"+
           "  \"App\": \"Taskbar Monitor Enhanced\",\r\n"+
-          "  \"Version\": \"1.7.2\",\r\n"+
-          "  \"PublicVersion\": \"1.7.2\",\r\n"+
+          "  \"Version\": \"1.7.8\",\r\n"+
+          "  \"PublicVersion\": \"1.7.8\",\r\n"+
           "  \"InternalRuntimeBaseline\": \"V1_1_2_R21_PRODUCTION_HARDENING\",\r\n"+
           "  \"SensorSupervisor\": \"V1_3_0_R33_STORAGE_COMPLETION_HARDENING\",\r\n"+
           "  \"SensorLayerStatus\": \""+sensorStatus.Replace("\\","\\\\").Replace("\"","\\\"")+"\",\r\n"+
@@ -256,14 +641,13 @@ internal static partial class SetupProgram
         Directory.CreateDirectory(payload);
         Extract("Payload.TaskbarMonitorSensorBroker.exe",Path.Combine(payload,"TaskbarMonitorSensorBroker.exe"));
         Extract("Payload.TaskbarMonitorSensorSupervisor.exe",Path.Combine(payload,"TaskbarMonitorSensorSupervisor.exe"));
-        // The official PawnIO binary is separately licensed. Public OSS Setup never embeds it.
-        // A previously installed PawnIO 2.2.0 may be reused; otherwise the sensor helper degrades
-        // safely and offers upstream manual installation, without silent driver downloads.
-        using(Stream pawn=Resource("Payload.PawnIO_setup.exe")){
-            if(pawn!=null && pawn.Length>0)
-                Extract("Payload.PawnIO_setup.exe",Path.Combine(payload,"PawnIO_setup.exe"));
-        }
-        Extract("Payload.TBME_Setup_Elevated_Helper.ps1",Path.Combine(payload,"TBME_Setup_Elevated_Helper.ps1"));
+        // This user-writable staging file is bound to the PE embedded ZIP hash
+        // before any elevated service changes; it is deleted with this payload.
+        Extract("Payload.LibreHardwareMonitor.zip",Path.Combine(payload,"LibreHardwareMonitor.zip"));
+        // R297: never stage or elevate a third-party executable in user-writable
+        // Temp, even if an optional private PE contains a PawnIO resource.
+        // Reuse compatible preinstalled PawnIO, otherwise require separate
+        // official installation with explicit owner consent.
         return payload;
     }
 
@@ -392,13 +776,10 @@ internal static partial class SetupProgram
             Directory.CreateDirectory(Path.Combine(AppRoot,"Logs"));
             try{File.Delete(SensorResultPath);}catch{}
             payload=PrepareSensorPayload();
-            string helper=Path.Combine(payload,"TBME_Setup_Elevated_Helper.ps1");
             string user=WindowsIdentity.GetCurrent().Name;
             int helperExit;
             try{
-                helperExit=ElevatedHelper(helper,
-                  "-Mode Install -PayloadDir \""+payload+"\" -AppRoot \""+AppRoot+"\" -UserId \""+user+"\"",
-                  110000);
+                helperExit=ElevatedHelper("Install",payload,AppRoot,user,110000);
             }catch(Exception ex){
                 outcome.Status="DEGRADED";
                 outcome.Message="The application installed successfully. The protected sensor supervisor did not report ready before Setup finished. "+ex.Message+" It will continue starting in the background; protected temperature fields may briefly show N/A.";
@@ -445,7 +826,7 @@ internal static partial class SetupProgram
     static SensorOutcome Install(bool desktop,bool startup)
     {
         if(!Environment.Is64BitOperatingSystem)
-            throw new InvalidOperationException("Taskbar Monitor Enhanced 1.7.2 requires 64-bit Windows.");
+            throw new InvalidOperationException("Taskbar Monitor Enhanced 1.7.8 requires 64-bit Windows.");
 
         // R114: prevent fresh-install code from ever overwriting an installed
         // product or user-owned files. Existing roots must use /update.
@@ -460,7 +841,7 @@ internal static partial class SetupProgram
         Extract("Payload.TaskbarMonitorEnhanced.exe",AppExe);
         Extract("Payload.TaskbarMonitorEnhanced.exe.config",AppExe+".config");
         Extract("Payload.TaskbarMonitorEnhanced.ico",Path.Combine(AppRoot,"TaskbarMonitorEnhanced.ico"));
-        Extract("Payload.TaskbarMonitorEnhanced.cs",Path.Combine(AppRoot,"TaskbarMonitorEnhanced.cs"));
+        // R255: avoid a redundant root source that breaks same-version maintenance.
         Extract("Payload.TaskbarMonitorEnhanced.cs",Path.Combine(AppRoot,"Source","TaskbarMonitorEnhanced.cs"));
         Extract("Payload.StudioThemes.cs",Path.Combine(AppRoot,"Source","StudioThemes.cs"));
         Extract("Payload.WallpaperStudio.cs",Path.Combine(AppRoot,"Source","WallpaperStudio.cs"));
@@ -475,7 +856,7 @@ internal static partial class SetupProgram
         string[] docs=new string[]{
           "LICENSE","README.md","AUTHORS.md","COPYRIGHT_AND_ATTRIBUTION.md",
           "AI_ASSISTED_DEVELOPMENT.md","THIRD_PARTY_NOTICES.md",
-          "RELEASE_NOTES_v1.7.2.md","UPSTREAM_REFERENCE_GPL_NOTICE.md"
+          "RELEASE_NOTES_v1.7.8.md","UPSTREAM_REFERENCE_GPL_NOTICE.md"
         };
         foreach(string doc in docs)
             Extract("Payload."+doc,Path.Combine(AppRoot,"Docs",doc));
@@ -557,13 +938,9 @@ internal static partial class SetupProgram
 
         string payload=Path.Combine(Path.GetTempPath(),"tbme_uninstall_"+Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(payload);
-        string helper=Path.Combine(payload,"TBME_Setup_Elevated_Helper.ps1");
-        Extract("Payload.TBME_Setup_Elevated_Helper.ps1",helper);
         string user=WindowsIdentity.GetCurrent().Name;
 
-        int helperExit=ElevatedHelper(helper,
-          "-Mode Uninstall -PayloadDir \""+payload+"\" -AppRoot \""+AppRoot+"\" -UserId \""+user+"\"",
-          90000);
+        int helperExit=ElevatedHelper("Uninstall",payload,AppRoot,user,90000);
         if(helperExit!=0)
             throw new InvalidOperationException("Protected sensor removal failed. Exit code: "+helperExit);
 
@@ -619,7 +996,7 @@ internal static partial class SetupProgram
             }
             if(!String.IsNullOrEmpty(path)){
                 string json="{\"Status\":\"PASS\",\"Resources\":"+(RequiredResources.Length+(pawnBundled?1:0))+
-                    ",\"Version\":\"1.7.2\",\"Publisher\":\"Dr. Ali-Akbar Emadeddin\""+
+                    ",\"Version\":\"1.7.8\",\"Publisher\":\"Dr. Ali-Akbar Emadeddin\""+
                     ",\"SensorArchitecture\":\"R21_PROCESS_ISOLATED\",\"SensorUpgradePolicy\":\"EXACT_R33_SUPERVISOR_R21_PROTOCOL\""+
                     ",\"PawnIOBundled\":"+(pawnBundled?"true":"false")+",\"EmbeddedMainSHA256\":\""+embeddedMainSHA256+"\",\"EmbeddedMainBytes\":"+embeddedMainBytes+"}";
                 File.WriteAllText(path,json,Encoding.UTF8);
@@ -658,7 +1035,7 @@ internal static partial class SetupProgram
             Icon=Icon.ExtractAssociatedIcon(Application.ExecutablePath);
 
             Label title=new Label();
-            title.Text=Product+"  1.7.2";
+            title.Text=Product+"  1.7.8";
             title.Font=new Font(Font.FontFamily,18,FontStyle.Bold);
             title.Left=28;title.Top=22;title.AutoSize=true;Controls.Add(title);
 
@@ -693,12 +1070,12 @@ internal static partial class SetupProgram
                     progress.Visible=false;
                     status.Text="Installation completed.";
                     if(outcome.IsHealthy){
-                        MessageBox.Show(Product+" 1.7.2 was installed successfully.\r\n\r\nProtected hardware sensor monitoring is active.",
+                        MessageBox.Show(Product+" 1.7.8 was installed successfully.\r\n\r\nProtected hardware sensor monitoring is active.",
                           "Setup complete",MessageBoxButtons.OK,MessageBoxIcon.Information);
                     }else{
                         string extra=outcome.RebootRequired ? "\r\n\r\nRestart Windows, then use Start Menu > Taskbar Monitor Enhanced - Repair Hardware Sensors if needed." :
                           "\r\n\r\nThe application is installed and usable. The sensor supervisor continues in the background. If protected CPU/GPU/storage telemetry is still unavailable after a short wait or restart, use Start Menu > Taskbar Monitor Enhanced - Repair Hardware Sensors.";
-                        MessageBox.Show(Product+" 1.7.2 was installed successfully.\r\n\r\n"+outcome.Message+extra,
+                        MessageBox.Show(Product+" 1.7.8 was installed successfully.\r\n\r\n"+outcome.Message+extra,
                           "Setup complete - sensor warning",MessageBoxButtons.OK,MessageBoxIcon.Warning);
                     }
                     Close();
@@ -832,6 +1209,24 @@ internal static partial class SetupProgram
     const string InstalledV16="1.6.0";
     const string InstalledV170="1.7.0";
     const string InstalledV171="1.7.1";
+    const string InstalledV172="1.7.2";
+    const string InstalledV173="1.7.3";
+    const string InstalledV174="1.7.4";
+    const string InstalledV175="1.7.5";
+    const string InstalledV176="1.7.6";
+    const string InstalledV177="1.7.7";
+    const string OfficialV177SetupSHA="395AEE56006F55FD5DCCFB52E1519088CE01A10386840D7008C6BA900136A06D";
+    const string OfficialV177MainSHA="A6D4BFD00C918C0601A12D185F414E92F2B6A85927042B811537B0BC37606253";
+    const string OfficialV176SetupSHA="D1FE446CC2D8274A5B63E8080FAB15767A6799B5A377584B0F7B923056E2CEE0";
+    const string OfficialV176MainSHA="0FA50938D330DB02D7D66593740F51FEE5D3036C59484E5697C34DCBC55A2DF8";
+    const string OfficialV175SetupSHA="8E37397F02273952B5866003FC156E152B13FC90D95D80B5DB4208046DD588EC";
+    const string OfficialV175MainSHA="25E0565301963467BF290908BE965F73EDDE6BF41EC693A4FE45ED19653FBDB6";
+    const string OfficialV174SetupSHA="C00F0C944E4BFBEE93989E4B5A29931D460CC0011ABDC8FDE6A498E467BCC1A1";
+    const string OfficialV174MainSHA="279DF6276973D45A1F979792718E7BA1A9DB31A44C3C34E7335C7BE1503A3E3C";
+    const string OfficialV173SetupSHA="9EB5C54B4AE4C36F4035F115AC87403D9238AC66AA9AFE58DC5B211311D9774B";
+    const string OfficialV173MainSHA="6C8895C040D50C88AF6F6D018F9F70FB481C294B7DABCB083DB78EE35F5D8D1C";
+    const string OfficialV172SetupSHA="225BCC259C392DA04F3E0157CAF22F96C4052282AAF02555E6F6E777F4CB8AF4";
+    const string OfficialV172MainSHA="84D5DBF6F2E6D1D2E2B3E6D9C9DA523E564A7F5240C08D34A456D934026B829F";
     const string OfficialV171SetupSHA="ABD106630F7BAB3471CAF3F5BD4313DFCF2D61DDE1DF79E72EFE91933C8F2F89";
     const string OfficialV171MainSHA="D50A9D03190719B8385AB2F7F7DBB3129EC7EC1C77ECBD8EF7F29832AEC26420";
     const string OfficialV170SetupSHA="148827212B716238DDB270309F393140EBE3CB935CD0E80D36233220A4BE611E";
@@ -952,6 +1347,166 @@ internal static partial class SetupProgram
         "Uninstall.exe|ABD106630F7BAB3471CAF3F5BD4313DFCF2D61DDE1DF79E72EFE91933C8F2F89",
     };
 
+    // R243: exact immutable official v1.7.2 embedded Setup payload SHA-256, no owner data.
+    // Root-level .cs is optional for this version; any present copy must match.
+    static readonly string[] OfficialStableV172Rows=new string[] {
+        "TaskbarMonitorEnhanced.cs|E43DE02A5DB89F8159408F1E1284B9311884736084D3565A5EE1B5035341B362",
+        "TaskbarMonitorEnhanced.exe|84D5DBF6F2E6D1D2E2B3E6D9C9DA523E564A7F5240C08D34A456D934026B829F",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|E43DE02A5DB89F8159408F1E1284B9311884736084D3565A5EE1B5035341B362",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|B71B4F1CD41A12A82DC470534563D2EA24FAAF38233D0158AC13085EF7F75ED0",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|76C65D5A16F384B7600EB4BDEDE7551283235CA32A662A248AF6A6DE03CD5A35",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|A3AD433D281894BB514F225ADEBA007B5F2E8641A1337BF57DE5248D2F96246A",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|FE7F6354C295B71607D14AB5D51843C2C951B2E984399FA5AA00BBF8AA4F8F0E",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.2.md|088EEAF5EE5200CE9686134CBD15F5C6C9436E8027E9DF1613190762911D01FA",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|225BCC259C392DA04F3E0157CAF22F96C4052282AAF02555E6F6E777F4CB8AF4",
+    };
+
+    // R256: pinned immutable public v1.7.3 fresh/upgraded source; never owner data.
+    // Root-level .cs may be present only if exact SHA matched.
+    static readonly string[] OfficialStableV173Rows=new string[] {
+        "TaskbarMonitorEnhanced.cs|5BB6F7D089251474E29ECFBCBB59653D18FA8664FD783BAB311B61D947851D32",
+        "TaskbarMonitorEnhanced.exe|6C8895C040D50C88AF6F6D018F9F70FB481C294B7DABCB083DB78EE35F5D8D1C",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|5BB6F7D089251474E29ECFBCBB59653D18FA8664FD783BAB311B61D947851D32",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|26B3E98C4E30361037EA35AE6326DE45C8087D8D562B7A7232D8FCF2CA589AAF",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|F11D20C67056AC054C690C630044F717657DAB6FE26E5997EEBFF25947CF69B9",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|25C2E5BD69BC4210757695501606942ED3ADD0C250848A2CC0B6AB4D8070578F",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|48026FC6A842A6BAEC519E04555A7291CD3DE339CBE59B9AAE635AAA1C1E8D37",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.3.md|CA1A8889BA56AA802BD9A2E2C0A45F885004DB5868702EBAE1076BF52C0F7683",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|9EB5C54B4AE4C36F4035F115AC87403D9238AC66AA9AFE58DC5B211311D9774B",
+    };
+
+    // R265: exact 22-file immutable official 1.7.4 ancestor; no optional root source.
+    static readonly string[] OfficialStableV174Rows=new string[] {
+        "TaskbarMonitorEnhanced.exe|279DF6276973D45A1F979792718E7BA1A9DB31A44C3C34E7335C7BE1503A3E3C",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|24460E03A325FD3F085302EAED0DDD7511BAD71F9DE1C722EDD61408CA754CF9",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|26B3E98C4E30361037EA35AE6326DE45C8087D8D562B7A7232D8FCF2CA589AAF",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|23B946D913810FB074F2C904CFF133A44948C57724818E3250B8E21B4D519E37",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|957B655CC028F4D68EB88A430CA4330107D7623004585601233DABD67ABED6B2",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|0D5CC4DAE08C3131DCCC095109EDEA997C757DE65E7A8BA296A2F399E5B67292",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.4.md|FF604D0B69C2116CD1A72C08189FCB18ACA5435894E3FECD822FE972CA996E07",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|C00F0C944E4BFBEE93989E4B5A29931D460CC0011ABDC8FDE6A498E467BCC1A1",
+    };
+
+    // R273: immutable public v1.7.5, 22 exact managed files, not user config.
+    static readonly string[] OfficialStableV175Rows=new string[] {
+        "TaskbarMonitorEnhanced.exe|25E0565301963467BF290908BE965F73EDDE6BF41EC693A4FE45ED19653FBDB6",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|53A37483D56C20A28FB4FA4D8DC207F3B3E06E081F32B7506C8438E321EC0C9E",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|26B3E98C4E30361037EA35AE6326DE45C8087D8D562B7A7232D8FCF2CA589AAF",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|C9872DAA819E9CA7453C158F5A4CB4CAB16FB1078606EE0BAF568555DBE68E57",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|66626A8A762ED34EDC91C7C3D03AD9889CAA5A8FEB64E973EF0EF0E08CDC8AF8",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|74955DE4D73DE9D7AD1C394187E6ACFC95013A92799D8BA9BB7DBDC5F4E7D701",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.5.md|AD3642ABD89BA1C31B2EEA83847FC3ED8861AEBFF9E664B5169A287601AAA16A",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|8E37397F02273952B5866003FC156E152B13FC90D95D80B5DB4208046DD588EC",
+    };
+
+    // Official immutable v1.7.6 predecessor: exact 22 managed paths and SHA.
+    static readonly string[] OfficialStableV176Rows=new string[] {
+        "TaskbarMonitorEnhanced.exe|0FA50938D330DB02D7D66593740F51FEE5D3036C59484E5697C34DCBC55A2DF8",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|086B21052E050B56B753634918D5279C1CAFE4918FE8F2D4FB6F4DC05CF040D5",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|396AD7DA39674099999ADB4A9C98458A876A8DE5BFABB1DC640EE46BC2F63306",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|2A3C0152CB8727B8F5AD281AAAA730F12C8D6CBC667866C751C3B866026563B1",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|EFC7104361C855FBE40A673A7CFBD868AAFE663ADC4F465D80A69E8D0E771F7C",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|9CCB3096C6697429527A24E0E2105E5CD7E6B76CEB39B70C8169570D8D796675",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.6.md|D8CF4A1F6596A043E4718E787D0098E4A10ED2D996CEF8766FC268DB72E620E7",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|D1FE446CC2D8274A5B63E8080FAB15767A6799B5A377584B0F7B923056E2CEE0",
+    };
+
+    // Published immutable official v1.7.7 managed identities, exact 22 files.
+    static readonly string[] OfficialStableV177Rows=new string[] {
+        "TaskbarMonitorEnhanced.exe|A6D4BFD00C918C0601A12D185F414E92F2B6A85927042B811537B0BC37606253",
+        "TaskbarMonitorEnhanced.exe.config|D2E51872D93F0793C02AD07DCBF8C2802F59708C666548372A4FDDDA5C7C5E4F",
+        "TaskbarMonitorEnhanced.ico|0AD07C8E5DB434EE0403FCC92557C89D6E8EDF6A61FABD285C45518DF73A8EEF",
+        "Source/TaskbarMonitorEnhanced.cs|B95546C73093486D54395FBEE891002A49913F9234713C16A11DCAC23EDFD962",
+        "Source/StudioThemes.cs|7872BBDDC6DFD95FD8943CD5B714E47A9AB44D40AC15CBD8DA35F643768808CD",
+        "Source/WallpaperStudio.cs|14DF1E87A49D6D791D4B9501E757E5E2EE466BCEF9618523CF0D1FCE584E461D",
+        "Source/TaskbarGlass.cs|396AD7DA39674099999ADB4A9C98458A876A8DE5BFABB1DC640EE46BC2F63306",
+        "Source/WorkspaceModels.cs|2146D1F369A89A684F504BAB71D6686A381E79260980F7E0ACBCBAC2B3484D19",
+        "Source/MonitorWorkspace.cs|BA512B04F326DF09B6F9051E34D5CF0C6D24C9DC12DF03B948624DA7F5941F65",
+        "Source/WorkspaceSelfTest.cs|7D1B3A1FA0A46CAC47D0063E2ED7929C5299F2DE0FD394BD6C82E53B72590FA5",
+        "Source/TaskbarMonitorSensorBroker.cs|D650CBC8861027F4A8EC3B48B71769840D2E6CB5F89DDBEBA949EE0CB6A72C0B",
+        "Source/TaskbarMonitorSensorSupervisor.cs|DEDF15076D4908A96B0791AC46DAE8F773D4256D9961EE44625F701D5770C60B",
+        "Source/TaskbarMonitorEnhanced_Setup.cs|65284119FE8759314BDDD3309837B2377AB6682BE98DF3995363908822A4CA38",
+        "Docs/LICENSE|3972DC9744F6499F0F9B2DBF76696F2AE7AD8AF9B23DDE66D6AF86C9DFB36986",
+        "Docs/README.md|F136012748AD1D1560EC5D5342D2D1228E5A90EE59B094ECA0E8D3CCAB51A63F",
+        "Docs/AUTHORS.md|0005B1D25E43C9CB1AF6C6428D7662F0F6E383D295CE66E5E7768ED8965BFA40",
+        "Docs/COPYRIGHT_AND_ATTRIBUTION.md|503CF0194431F8FFE884014165111702061BB16B57C4BA118CE334489DBF4153",
+        "Docs/AI_ASSISTED_DEVELOPMENT.md|7793264C5E9256888B069E88BD9ABAE692193CFEB6C28E21ECC8F69F3E3172EB",
+        "Docs/THIRD_PARTY_NOTICES.md|7A8F14410B0B934447FB952E7AB0248B8D3342F88358F0F6B0D4332833D3F559",
+        "Docs/RELEASE_NOTES_v1.7.7.md|74FDDEBDDE733F1F0E2BE2C84824E4784D4CC244094660199094DA5550091A83",
+        "Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md|14B86621663CDFB7A6750D9E5ABFE7BE8AA72433A56AA08382698BA09261A293",
+        "Uninstall.exe|395AEE56006F55FD5DCCFB52E1519088CE01A10386840D7008C6BA900136A06D",
+    };
+
     sealed class UpgradeTarget
     {
         internal readonly string Rel;
@@ -979,14 +1534,20 @@ internal static partial class SetupProgram
         new UpgradeTarget("Docs/COPYRIGHT_AND_ATTRIBUTION.md","Payload.COPYRIGHT_AND_ATTRIBUTION.md"),
         new UpgradeTarget("Docs/AI_ASSISTED_DEVELOPMENT.md","Payload.AI_ASSISTED_DEVELOPMENT.md"),
         new UpgradeTarget("Docs/THIRD_PARTY_NOTICES.md","Payload.THIRD_PARTY_NOTICES.md"),
-        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.2.md","Payload.RELEASE_NOTES_v1.7.2.md"),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.8.md","Payload.RELEASE_NOTES_v1.7.8.md"),
         new UpgradeTarget("Docs/UPSTREAM_REFERENCE_GPL_NOTICE.md","Payload.UPSTREAM_REFERENCE_GPL_NOTICE.md"),
         new UpgradeTarget("Uninstall.exe","@SELF"),
         new UpgradeTarget("install_state.json","@INSTALLSTATE"),
         new UpgradeTarget("TaskbarMonitorEnhanced.cs",null), // redundant v1.6 root duplicate
         new UpgradeTarget("Docs/RELEASE_NOTES_v1.6.0.md",null), // superseded v1.6 official file
         new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.0.md",null), // exact historical managed note only
-        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.1.md",null) // previous version; refuse any user-edited bytes
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.1.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.2.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.3.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.4.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.5.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.6.md",null),
+        new UpgradeTarget("Docs/RELEASE_NOTES_v1.7.7.md",null) // previous version, guarded byte-for-byte
     };
 
     static string UpgradeHash(string path)
@@ -1012,6 +1573,18 @@ internal static partial class SetupProgram
         { rows=OfficialStableV170Rows; expectedSetup=OfficialV170SetupSHA; count=23; }
         else if(version==InstalledV171 && channel=="OFFICIAL_STABLE_V171")
         { rows=OfficialStableV171Rows; expectedSetup=OfficialV171SetupSHA; count=23; }
+        else if(version==InstalledV172 && channel=="OFFICIAL_STABLE_V172")
+        { rows=OfficialStableV172Rows; expectedSetup=OfficialV172SetupSHA; count=23; }
+        else if(version==InstalledV173 && channel=="OFFICIAL_STABLE_V173")
+        { rows=OfficialStableV173Rows; expectedSetup=OfficialV173SetupSHA; count=23; }
+        else if(version==InstalledV177 && channel=="OFFICIAL_STABLE_V177")
+        { rows=OfficialStableV177Rows; expectedSetup=OfficialV177SetupSHA; count=22; }
+        else if(version==InstalledV176 && channel=="OFFICIAL_STABLE_V176")
+        { rows=OfficialStableV176Rows; expectedSetup=OfficialV176SetupSHA; count=22; }
+        else if(version==InstalledV175 && channel=="OFFICIAL_STABLE_V175")
+        { rows=OfficialStableV175Rows; expectedSetup=OfficialV175SetupSHA; count=22; }
+        else if(version==InstalledV174 && channel=="OFFICIAL_STABLE_V174")
+        { rows=OfficialStableV174Rows; expectedSetup=OfficialV174SetupSHA; count=22; }
         else if(version==InstalledV170 && channel=="PREVIEW1")
         { rows=LegacyPreview1Rows; expectedSetup=LegacyPreview1InstallerSha; count=23; }
         else throw new InvalidDataException("Unsupported exact prior source identity; no downgrade/second root.");
@@ -1037,17 +1610,23 @@ internal static partial class SetupProgram
         string root=Path.GetFullPath(AppRoot).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
         if(!path.StartsWith(root,StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("Upgrade refused path outside canonical app root.");
+        // Path.GetFullPath is lexical only; reject junctions/links before any live I/O.
+        CheckNoReparse(path);
         return path;
     }
 
     static void CheckNoReparse(string path)
     {
         string root=Path.GetFullPath(AppRoot);
-        string current=path;
+        string current=Path.GetFullPath(path);
         while(!String.IsNullOrEmpty(current)){
-            if((File.Exists(current)||Directory.Exists(current)) &&
-              (File.GetAttributes(current)&FileAttributes.ReparsePoint)!=0)
-                throw new IOException("Upgrade refuses an app component symlink/junction: "+current);
+            // File.Exists can hide inaccessible or dangling reparse paths.
+            // Only genuinely absent components may be skipped; all other I/O
+            // errors must fail closed before a rollback/write/delete.
+            try{
+                if((File.GetAttributes(current)&FileAttributes.ReparsePoint)!=0)
+                    throw new IOException("Upgrade refuses an app component symlink/junction: "+current);
+            }catch(FileNotFoundException){}catch(DirectoryNotFoundException){}
             if(String.Equals(current,root,StringComparison.OrdinalIgnoreCase))break;
             current=Path.GetDirectoryName(current);
         }
@@ -1112,7 +1691,7 @@ internal static partial class SetupProgram
             throw new InvalidDataException("Old install state Version/PublicVersion mismatch.");
         string prior=installed.Groups["v"].Value;
         if(prior==Version)return source;
-        if(prior!=InstalledV16 && prior!=InstalledV170 && prior!=InstalledV171)
+        if(prior!=InstalledV16 && prior!=InstalledV170 && prior!=InstalledV171 && prior!=InstalledV172 && prior!=InstalledV173 && prior!=InstalledV174 && prior!=InstalledV175 && prior!=InstalledV176 && prior!=InstalledV177)
             throw new InvalidDataException("Prior install state version not a pinned officially allowed ancestor.");
         string next=ReplaceStateVersion(source,"Version",prior);
         next=ReplaceStateVersion(next,"PublicVersion",prior);
@@ -1138,7 +1717,7 @@ internal static partial class SetupProgram
             if(bytes.Length<1 || fresh.ContainsKey(t.Rel))throw new InvalidDataException("Duplicate/empty payload "+t.Rel);
             fresh.Add(t.Rel,bytes);
         }
-        if(fresh.Count!=UpgradeTargets.Length-4)
+        if(fresh.Count!=UpgradeTargets.Length-10)
             throw new InvalidDataException("Upgrade static target map is invalid.");
         return fresh;
     }
@@ -1147,7 +1726,7 @@ internal static partial class SetupProgram
     {
         // Only one SHA-pinned historical Stable file may be absent. Any present
         // occurrence still requires the exact immutable published source hash.
-        return (channel=="OFFICIAL_STABLE_V170" || channel=="OFFICIAL_STABLE_V171") &&
+        return (channel=="OFFICIAL_STABLE_V170" || channel=="OFFICIAL_STABLE_V171" || channel=="OFFICIAL_STABLE_V172" || channel=="OFFICIAL_STABLE_V173") &&
                String.Equals(rel,"TaskbarMonitorEnhanced.cs",StringComparison.Ordinal);
     }
 
@@ -1173,10 +1752,19 @@ internal static partial class SetupProgram
     }
 
     static string UpgradeRoot {get{return Path.Combine(AppRoot,UpgradeStageName);}}
+    static string RetiredUpgradeRoot {get{return Path.Combine(AppRoot,UpgradeStageName+"-retired");}}
     static string Stage(string part,string rel)
     {
         if(part!="new" && part!="old")throw new InvalidDataException("Unexpected stage area.");
-        return Path.Combine(UpgradeRoot,part,rel.Replace('/',Path.DirectorySeparatorChar));
+        if(String.IsNullOrWhiteSpace(rel) || Path.IsPathRooted(rel) || rel.Contains("..") ||
+           rel.Contains(":") || rel.StartsWith("/") || rel.StartsWith("\\"))
+            throw new InvalidDataException("Upgrade refused unsafe staged resource path.");
+        string path=Path.GetFullPath(Path.Combine(UpgradeRoot,part,rel.Replace('/',Path.DirectorySeparatorChar)));
+        string root=Path.GetFullPath(UpgradeRoot).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
+        if(!path.StartsWith(root,StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Upgrade refused stage escape.");
+        CheckNoReparse(path);
+        return path;
     }
 
     static void WritePhase(string phase)
@@ -1250,7 +1838,7 @@ internal static partial class SetupProgram
             }
         }
         File.WriteAllText(Path.Combine(UpgradeRoot,"index.txt"),String.Join("\n",lines.ToArray()),Encoding.ASCII);
-        if(previousVersion!=InstalledV16 && previousVersion!=InstalledV170 && previousVersion!=InstalledV171 && previousVersion!=Version)throw new InvalidDataException("Invalid previous version for journal.");
+        if(previousVersion!=InstalledV16 && previousVersion!=InstalledV170 && previousVersion!=InstalledV171 && previousVersion!=InstalledV172 && previousVersion!=InstalledV173 && previousVersion!=InstalledV174 && previousVersion!=InstalledV175 && previousVersion!=InstalledV176 && previousVersion!=InstalledV177 && previousVersion!=Version)throw new InvalidDataException("Invalid previous version for journal.");
         File.WriteAllText(Path.Combine(UpgradeRoot,"previous_version.txt"),previousVersion,Encoding.ASCII);
         WritePhase("PREPARED");
     }
@@ -1273,27 +1861,130 @@ internal static partial class SetupProgram
               (parts[1]!="-" && !Regex.IsMatch(parts[1],"^[0-9A-F]{64}$")) ||
               (parts[2]!="-" && !Regex.IsMatch(parts[2],"^[0-9A-F]{64}$")))
                 throw new InvalidDataException("Upgrade journal path or digest modified.");
-            parsed.Add(new StageEntry(parts[0],parts[1],parts[2]));
+            // Convert the validated on-disk label back to the compiled-in target before filesystem use.
+            parsed.Add(new StageEntry(UpgradeTargets[i].Rel,parts[1],parts[2]));
         }
         return parsed;
     }
 
+    // R299: do not recursively delete a user-writable upgrade journal. A
+    // junction inserted after the preflight must not turn cleanup into a
+    // recursive deletion of unrelated user files.
     static void CleanOwnedStage(List<StageEntry> rows)
     {
-        HashSet<string> known=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string root=Path.GetFullPath(UpgradeRoot).TrimEnd(Path.DirectorySeparatorChar);
+        string prefix=root+Path.DirectorySeparatorChar;
+        CheckNoReparse(root);
+        string retired=Path.GetFullPath(RetiredUpgradeRoot);
+        CheckNoReparse(retired);
+        if(Directory.Exists(retired) || File.Exists(retired))
+            throw new IOException("Prior retired upgrade journal must be recovered first.");
+        HashSet<string> knownFiles=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach(string filename in new string[]{"owner.txt","phase.txt","index.txt","phase.tmp","previous_version.txt"})
-            known.Add(Path.GetFullPath(Path.Combine(UpgradeRoot,filename)));
+            knownFiles.Add(Path.GetFullPath(Path.Combine(root,filename)));
         foreach(StageEntry r in rows){
-            known.Add(Path.GetFullPath(Stage("old",r.Rel)));
-            known.Add(Path.GetFullPath(Stage("new",r.Rel)));
+            knownFiles.Add(Path.GetFullPath(Stage("old",r.Rel)));
+            knownFiles.Add(Path.GetFullPath(Stage("new",r.Rel)));
         }
-        foreach(string path in Directory.GetFiles(UpgradeRoot,"*",SearchOption.AllDirectories))
-            if(!known.Contains(Path.GetFullPath(path)))
-                throw new InvalidOperationException("Unknown file inside update stage; leave stage intact: "+path);
-        foreach(string path in Directory.GetDirectories(UpgradeRoot,"*",SearchOption.AllDirectories))
-            if((File.GetAttributes(path)&FileAttributes.ReparsePoint)!=0)
-                throw new IOException("Unexpected upgrade stage reparse directory.");
-        Directory.Delete(UpgradeRoot,true);
+        HashSet<string> knownDirs=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        knownDirs.Add(root);
+        foreach(string filename in knownFiles){
+            if(!filename.StartsWith(prefix,StringComparison.OrdinalIgnoreCase))
+                throw new IOException("Upgrade cleanup path escaped canonical stage.");
+            string directory=Path.GetDirectoryName(filename);
+            while(!String.Equals(directory,root,StringComparison.OrdinalIgnoreCase)){
+                if(String.IsNullOrEmpty(directory) || !directory.StartsWith(prefix,StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Upgrade cleanup directory escaped canonical stage.");
+                knownDirs.Add(directory);
+                directory=Path.GetDirectoryName(directory);
+            }
+        }
+        // Enumerate one directory at a time: reject unexpected empty dirs as
+        // well as files and reparse entries BEFORE deleting any known member.
+        List<string> pending=new List<string>();pending.Add(root);
+        while(pending.Count>0){
+            string directory=pending[pending.Count-1];pending.RemoveAt(pending.Count-1);
+            CheckNoReparse(directory);
+            foreach(string entry in Directory.GetFileSystemEntries(directory)){
+                string full=Path.GetFullPath(entry);
+                if(!full.StartsWith(prefix,StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("Upgrade cleanup observed path escape.");
+                FileAttributes attributes=File.GetAttributes(full);
+                if((attributes&FileAttributes.ReparsePoint)!=0)
+                    throw new IOException("Upgrade cleanup refuses reparse member: "+full);
+                if((attributes&FileAttributes.Directory)!=0){
+                    if(!knownDirs.Contains(full))
+                        throw new IOException("Unknown directory inside update stage; leave stage intact: "+full);
+                    pending.Add(full);
+                }else if(!knownFiles.Contains(full)){
+                    throw new IOException("Unknown file inside update stage; leave stage intact: "+full);
+                }
+            }
+        }
+        // Unlink only exact known files; remove directories with recursive=false.
+        // Keep owner/index/phase markers until descendants have been removed.
+        string[] metadata=new string[]{"phase.tmp","previous_version.txt","index.txt","phase.txt","owner.txt"};
+        HashSet<string> metadataPaths=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach(string name in metadata)metadataPaths.Add(Path.Combine(root,name));
+        foreach(string filename in knownFiles){
+            if(metadataPaths.Contains(filename))continue;
+            CheckNoReparse(filename);
+            if(File.Exists(filename))File.Delete(filename);
+        }
+        List<string> directories=knownDirs.Where(d=>!String.Equals(d,root,StringComparison.OrdinalIgnoreCase)).ToList();
+        directories.Sort(delegate(string a,string b){
+            int c=b.Length.CompareTo(a.Length);
+            return c!=0?c:StringComparer.OrdinalIgnoreCase.Compare(a,b);
+        });
+        foreach(string directory in directories){
+            CheckNoReparse(directory);
+            if(Directory.Exists(directory))Directory.Delete(directory,false);
+        }
+        // Keep index, phase, prior-version and ownership metadata in the
+        // active journal until a same-parent move retires that whole journal.
+        // Interruption before the move resumes original recovery; after it
+        // only a fixed, bounded metadata tombstone remains.
+        CheckNoReparse(root);
+        CheckNoReparse(retired);
+        Directory.Move(root,retired);
+        FinishRetiredUpgradeStageIfAny();
+    }
+
+    // R300: retryable, nonrecursive cleanup of exact retired metadata only.
+    static void FinishRetiredUpgradeStageIfAny()
+    {
+        string root=Path.GetFullPath(RetiredUpgradeRoot);
+        CheckNoReparse(root);
+        if(File.Exists(root))
+            throw new IOException("Retired upgrade path is not a directory.");
+        if(!Directory.Exists(root))return;
+        string owner=Path.Combine(root,"owner.txt");
+        string[] metadata=new string[]{"phase.tmp","previous_version.txt","index.txt","phase.txt","owner.txt"};
+        HashSet<string> names=new HashSet<string>(metadata,StringComparer.OrdinalIgnoreCase);
+        string[] entries=Directory.GetFileSystemEntries(root);
+        foreach(string entry in entries){
+            string full=Path.GetFullPath(entry);
+            if(!String.Equals(Path.GetDirectoryName(full),root,StringComparison.OrdinalIgnoreCase) ||
+               !names.Contains(Path.GetFileName(full)))
+                throw new IOException("Unknown retired upgrade member; preserve for review: "+full);
+            CheckNoReparse(full);
+            FileAttributes attributes=File.GetAttributes(full);
+            if((attributes&(FileAttributes.Directory|FileAttributes.ReparsePoint))!=0)
+                throw new IOException("Retired upgrade member is not an ordinary file: "+full);
+        }
+        // Owner is last; if it is absent, only an empty directory is safe.
+        if(File.Exists(owner)){
+            if(File.ReadAllText(owner,Encoding.ASCII)!=UpgradeStageMarker)
+                throw new IOException("Retired upgrade ownership marker mismatch.");
+        }else if(entries.Length!=0)
+            throw new IOException("Retired upgrade journal lost its ownership marker.");
+        foreach(string name in metadata){
+            string file=Path.Combine(root,name);
+            CheckNoReparse(file);
+            if(File.Exists(file))File.Delete(file);
+        }
+        CheckNoReparse(root);
+        Directory.Delete(root,false);
     }
 
     static void RestoreInterruptedUpgrade(List<StageEntry> rows)
@@ -1301,7 +1992,19 @@ internal static partial class SetupProgram
         string priorVersionPath=Path.Combine(UpgradeRoot,"previous_version.txt");
         if(!File.Exists(priorVersionPath))throw new IOException("Previous upgrade version missing; retain stage.");
         string priorVersion=File.ReadAllText(priorVersionPath,Encoding.ASCII);
-        if(priorVersion!=InstalledV16 && priorVersion!=InstalledV170 && priorVersion!=InstalledV171 && priorVersion!=Version)throw new IOException("Unknown previous version; retain stage.");
+        if(priorVersion!=InstalledV16 && priorVersion!=InstalledV170 && priorVersion!=InstalledV171 && priorVersion!=InstalledV172 && priorVersion!=InstalledV173 && priorVersion!=InstalledV174 && priorVersion!=InstalledV175 && priorVersion!=InstalledV176 && priorVersion!=InstalledV177 && priorVersion!=Version)throw new IOException("Unknown previous version; retain stage.");
+        // R284: an interrupted File.Copy(old, old/rel.restore, false) can
+        // leave only a partial updater-owned scratch. A retry must recreate
+        // only these exact scratch paths AFTER owner/index verification.
+        // Unknown files and reparse paths remain rejected.
+        foreach(StageEntry row in rows){
+            if(row.Previous=="-")continue;
+            string scratch=Stage("old",row.Rel+".restore");
+            if(File.Exists(scratch)){
+                CheckNoReparse(scratch);
+                File.Delete(scratch);
+            }
+        }
         // This works after a mid-commit process kill: exact old snapshots are persisted
         // on the same volume, and new-only files are removed only if their SHA is known.
         for(int i=rows.Count-1;i>=0;i--){
@@ -1341,18 +2044,72 @@ internal static partial class SetupProgram
         }
     }
 
+    // R301: COMMITTING rollback needs a separate durable success marker.
+    // Otherwise a crash during backup cleanup makes the next COMMITTING
+    // replay require already-deleted old snapshots. ROLLED_BACK is written
+    // only after the old live file hashes and HKCU version have been restored.
+    static void VerifyRolledBackUpgrade(List<StageEntry> rows)
+    {
+        string versionPath=Path.Combine(UpgradeRoot,"previous_version.txt");
+        CheckNoReparse(versionPath);
+        if(!File.Exists(versionPath))
+            throw new IOException("Rolled-back upgrade version missing; retain stage.");
+        string oldVersion=File.ReadAllText(versionPath,Encoding.ASCII);
+        if(oldVersion!=InstalledV16 && oldVersion!=InstalledV170 &&
+           oldVersion!=InstalledV171 && oldVersion!=InstalledV172 &&
+           oldVersion!=InstalledV173 && oldVersion!=InstalledV174 &&
+           oldVersion!=InstalledV175 && oldVersion!=InstalledV176 &&
+           oldVersion!=InstalledV177 && oldVersion!=Version)
+            throw new IOException("Rolled-back upgrade version is not pinned.");
+        using(RegistryKey key=Registry.CurrentUser.OpenSubKey(UninstallKey,false)){
+            if(key==null || !String.Equals(Convert.ToString(key.GetValue("DisplayVersion")),
+                                            oldVersion,StringComparison.Ordinal))
+                throw new IOException("Rolled-back uninstall registration mismatch.");
+        }
+        foreach(StageEntry row in rows){
+            string live=UPath(row.Rel);
+            if(row.Previous=="-"){
+                if(File.Exists(live))
+                    throw new IOException("Rolled-back new component unexpectedly remains: "+row.Rel);
+            }else if(!File.Exists(live) || UpgradeHash(live)!=row.Previous){
+                throw new IOException("Rolled-back previous SHA mismatch: "+row.Rel);
+            }
+        }
+    }
+
     static void RecoverUpgradeStageIfAny()
     {
+        FinishRetiredUpgradeStageIfAny();
         if(!Directory.Exists(UpgradeRoot))return;
         CheckNoReparse(UpgradeRoot);
+        // Interrupted journals are writable in the user's AppData. Before
+        // reading them or mutating ANY managed file, reject their descendant
+        // links, including link-shaped phase/index files and stage subtrees.
+        foreach(string name in new string[]{"owner.txt","phase.txt","phase.tmp",
+                  "index.txt","previous_version.txt","old","new"})
+            CheckNoReparse(Path.Combine(UpgradeRoot,name));
         string phase=GetPhase();
         List<StageEntry> rows=ReadStageIndex();
+        foreach(StageEntry r in rows){
+            UPath(r.Rel);
+            Stage("old",r.Rel);
+            Stage("new",r.Rel);
+            if(r.Previous!="-")Stage("old",r.Rel+".restore");
+        }
         if(phase=="PREPARED"){
             // No managed target is modified before COMMITTING is durably written.
             CleanOwnedStage(rows);return;
         }
         if(phase=="COMMITTING"){
             RestoreInterruptedUpgrade(rows);
+            WritePhase("ROLLED_BACK");
+            CleanOwnedStage(rows);return;
+        }
+        if(phase=="ROLLED_BACK"){
+            // A previous rollback already succeeded; its old snapshots may
+            // have been removed before process death. Verify the exact live
+            // old version rather than attempting to consume them again.
+            VerifyRolledBackUpgrade(rows);
             CleanOwnedStage(rows);return;
         }
         if(phase=="COMMITTED"){
@@ -1390,8 +2147,8 @@ internal static partial class SetupProgram
         CheckSingleCanonicalRoot();
         string installed=CurrentInstalledVersion();
         string newSha=Sha256Resource("Payload.TaskbarMonitorEnhanced.exe");
-        if(installed!=InstalledV16 && installed!=InstalledV170 && installed!=InstalledV171 && installed!=Version)
-            throw new InvalidOperationException("Only SHA-pinned official v1.6, v1.7.0 stable/Preview1 or v1.7.1 may upgrade in place.");
+        if(installed!=InstalledV16 && installed!=InstalledV170 && installed!=InstalledV171 && installed!=InstalledV172 && installed!=InstalledV173 && installed!=InstalledV174 && installed!=InstalledV175 && installed!=InstalledV176 && installed!=InstalledV177 && installed!=Version)
+            throw new InvalidOperationException("Only SHA-pinned official v1.6/v1.7.0/v1.7.1/v1.7.2/v1.7.3/v1.7.4/v1.7.5/v1.7.6/v1.7.7 may upgrade in place.");
         string channel="OFFICIAL_V16";
         string currentMainSHA=UpgradeHash(AppExe);
         string installedSetup=UPath("Uninstall.exe");
@@ -1405,7 +2162,13 @@ internal static partial class SetupProgram
                !File.Exists(UPath("TaskbarMonitorEnhanced.cs")) &&
                !File.Exists(UPath("Docs/RELEASE_NOTES_v1.6.0.md")) &&
                 !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.0.md")) &&
-                !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.1.md")))
+                !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.1.md")) &&
+                 !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.2.md")) &&
+                 !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.3.md")) &&
+                  !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.4.md")) &&
+                  !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.5.md")) &&
+                  !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.6.md")) &&
+                  !File.Exists(UPath("Docs/RELEASE_NOTES_v1.7.7.md")))
                 return ExistingSensorOutcome();
             throw new InvalidOperationException("Unknown current-version maintenance revision; no files changed.");
         }
@@ -1424,6 +2187,45 @@ internal static partial class SetupProgram
             if(currentMainSHA!=OfficialV171MainSHA || oldSetupSHA!=OfficialV171SetupSHA)
                 throw new InvalidOperationException("Unknown v1.7.1 source/Setup identity; refuse before any mutation.");
             channel="OFFICIAL_STABLE_V171";
+        }
+        if(installed==InstalledV172)
+        {
+            if(currentMainSHA!=OfficialV172MainSHA || oldSetupSHA!=OfficialV172SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.2 source/Setup identity; refuse before any mutation.");
+            channel="OFFICIAL_STABLE_V172";
+        }
+        if(installed==InstalledV173)
+        {
+            if(currentMainSHA!=OfficialV173MainSHA || oldSetupSHA!=OfficialV173SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.3 source/Setup identity; refuse before any mutation.");
+            channel="OFFICIAL_STABLE_V173";
+        }
+        if(installed==InstalledV174)
+        {
+            if(currentMainSHA!=OfficialV174MainSHA || oldSetupSHA!=OfficialV174SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.4 source/Setup identity; refuse before any mutation.");
+            channel="OFFICIAL_STABLE_V174";
+        }
+
+        if(installed==InstalledV177)
+        {
+            if(currentMainSHA!=OfficialV177MainSHA || oldSetupSHA!=OfficialV177SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.7 Main/Setup identity; NO mutation.");
+            channel="OFFICIAL_STABLE_V177";
+        }
+
+        if(installed==InstalledV176)
+        {
+            if(currentMainSHA!=OfficialV176MainSHA || oldSetupSHA!=OfficialV176SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.6 Main/Setup identity; NO mutation.");
+            channel="OFFICIAL_STABLE_V176";
+        }
+
+        if(installed==InstalledV175)
+        {
+            if(currentMainSHA!=OfficialV175MainSHA || oldSetupSHA!=OfficialV175SetupSHA)
+                throw new InvalidOperationException("Unknown official v1.7.5 Main/Setup identity; NO mutation.");
+            channel="OFFICIAL_STABLE_V175";
         }
 
         // No force-kill; the owner must close their currently running app normally.

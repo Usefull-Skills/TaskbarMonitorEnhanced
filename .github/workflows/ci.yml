@@ -66,6 +66,29 @@ jobs:
         shell: pwsh
         run: ./build/Build.ps1
 
+      - name: R080 Windows 5.1 exact embedded Helper/status IPC without UAC
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          ./build/Test-R080-SensorStatusIpc-Native.ps1 -AssemblyPath (Resolve-Path 'build/_out/Setup/TaskbarMonitorEnhanced_Setup_1.7.8.exe').Path
+
+      - name: R089 native PowerShell fast-exit and malformed IPC frames (no UAC)
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          ./build/Test-R089-BoundedSensorIpcFrame-Native.ps1 -AssemblyPath (Resolve-Path 'build/_out/Setup/TaskbarMonitorEnhanced_Setup_1.7.8.exe').Path
+
+      - name: R090 exact-typed sensor result JSON schema and no-file-on-reject
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          ./build/Test-R090-SensorResultSchema-Native.ps1 -AssemblyPath (Resolve-Path 'build/_out/Setup/TaskbarMonitorEnhanced_Setup_1.7.8.exe').Path
+
+      - name: R090 alternate-user SID denied by actual asInvoker IPC pipe (hosted Windows only; no UAC)
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          ./build/Test-R090-NamedPipeCrossSid-Native.ps1 -AssemblyPath (Resolve-Path 'build/_out/Setup/TaskbarMonitorEnhanced_Setup_1.7.8.exe').Path
       - name: Verify deterministic clean-clone build
         shell: pwsh
         run: ./build/Verify-Determinism.ps1
@@ -106,6 +129,26 @@ jobs:
           $glass = Get-Content ./artifacts/ci-visual/glassproof/GLASS_PROOF.json -Raw | ConvertFrom-Json
           if ($glass.Status -ne 'PASS' -or $glass.Tests -ne 196) { throw '49-theme alpha contrast foreground proof did not PASS.' }
 
+      - name: R272 semantic thermal warnings visible as red ink in Glass on all 49 themes
+        shell: pwsh
+        run: |
+          ./build/Test-GlassThermal-R272.ps1 -MainPath ./build/_out/App/TaskbarMonitorEnhanced.exe -OutDir ./artifacts/ci-thermal-r272
+          $r = Get-Content ./artifacts/ci-thermal-r272/R272_ACCEPTANCE.json -Raw | ConvertFrom-Json
+          if ($r.Status -cne 'PASS' -or $r.ThemePairs -ne 98 -or $r.AlertPixelMinimum -lt 40 -or $r.ColdPixelMaximum -ne 0) {
+              throw 'R272 threshold-to-red foreground Glass semantic contract failed.'
+          }
+      - name: R244 nine-page Settings UI overlap and Glass mode renderer guard
+        shell: powershell
+        run: |
+          $ErrorActionPreference='Stop'
+          ./build/Test-SettingsUi-R244.ps1 -MainPath ./build/_out/App/TaskbarMonitorEnhanced.exe -OutDir ./artifacts/ci-settings-r244
+          $s = Get-Content ./artifacts/ci-settings-r244/R244_SETTINGS_UI.json -Raw | ConvertFrom-Json
+          if($s.Status -cne 'PASS_ALL_NINE_SETTINGS_PAGES_NO_CONTROL_OVERLAP' -or
+             $s.SettingsPages -ne 9 -or $s.SiblingOverlapCount -ne 0 -or
+             $s.GlassStatusSeparate -ne $true -or $s.GlassTrackBackAlpha -ne 255) {
+             throw 'R244.Settings UI glass switch overlap/layout regression'
+          }
+
       - name: Portable runtime contract probes (5 suites; installed host checks separate)
         shell: pwsh
         run: |
@@ -123,7 +166,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          ./build/Verify-Release-Metadata-R155.ps1 -SelfTest
+          ./build/Verify-Release-Metadata-R273.ps1 -SelfTest
           if ($LASTEXITCODE -ne 0) {throw 'R136 release version, 5 output SHA and SBOM source gates FAILED'}
 
       - name: Attest binary build provenance
@@ -156,6 +199,10 @@ jobs:
             artifacts/ci-visual/SUMMARY.json
             artifacts/ci-visual/chartglassproof/CHART_GLASS_PROOF.json
             artifacts/ci-visual/glassproof/GLASS_PROOF.json
+            artifacts/ci-thermal-r272/R272_ACCEPTANCE.json
+            artifacts/ci-thermal-r272/real-thermal-pixels/THERMAL_GLASS_PROOF.json
+            artifacts/ci-settings-r244/R244_SETTINGS_UI.json
+            artifacts/ci-settings-r244/R244_GLASS_SWITCH_ON.png
             artifacts/ci-runtime/SUMMARY.json
             artifacts/BUILD_MANIFEST.json
             artifacts/SBOM.spdx.json
